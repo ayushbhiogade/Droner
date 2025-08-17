@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+	<Document>
+		<name>Kempegowda International Airport (BLR) - Test AOI</name>
+		<description>Approximate rectangular AOI around BLR for large-area testing</description>
+		<Placemark>
+			<name>BLR AOI</name>
+			<Style>
+				<LineStyle>
+					<color>ff0000ff</color>
+					<width>2</width>
+				</LineStyle>
+				<PolyStyle>
+					<color>4d0000ff</color>
+				</PolyStyle>
+			</Style>
+			<Polygon>
+				<outerBoundaryIs>
+					<LinearRing>
+						<coordinates>
+							77.680000,13.220000,0
+							77.735000,13.220000,0
+							77.735000,13.180000,0
+							77.680000,13.180000,0
+							77.680000,13.220000,0
+						</coordinates>
+					</LinearRing>
+				</outerBoundaryIs>
+			</Polygon>
+		</Placemark>
+	</Document>
+</kml> 

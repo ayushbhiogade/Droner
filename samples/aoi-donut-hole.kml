@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+	<Document>
+		<name>AOI - Donut With Hole</name>
+		<Placemark>
+			<name>Donut AOI</name>
+			<Style>
+				<LineStyle>
+					<color>ffff8800</color>
+					<width>2</width>
+				</LineStyle>
+				<PolyStyle>
+					<color>4dff8800</color>
+				</PolyStyle>
+			</Style>
+			<Polygon>
+				<outerBoundaryIs>
+					<LinearRing>
+						<coordinates>
+							-74.008200,40.714400,0
+							-74.005300,40.714400,0
+							-74.005300,40.712400,0
+							-74.008200,40.712400,0
+							-74.008200,40.714400,0
+						</coordinates>
+					</LinearRing>
+				</outerBoundaryIs>
+				<innerBoundaryIs>
+					<LinearRing>
+						<coordinates>
+							-74.007500,40.713900,0
+							-74.006000,40.713900,0
+							-74.006000,40.712900,0
+							-74.007500,40.712900,0
+							-74.007500,40.713900,0
+						</coordinates>
+					</LinearRing>
+				</innerBoundaryIs>
+			</Polygon>
+		</Placemark>
+	</Document>
+</kml> 

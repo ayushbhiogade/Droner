@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+	<Document>
+		<name>AOI - Irregular Pentagon</name>
+		<Placemark>
+			<name>Irregular Pentagon AOI</name>
+			<Style>
+				<LineStyle>
+					<color>ffbb22ff</color>
+					<width>2</width>
+				</LineStyle>
+				<PolyStyle>
+					<color>4dbb22ff</color>
+				</PolyStyle>
+			</Style>
+			<Polygon>
+				<outerBoundaryIs>
+					<LinearRing>
+						<coordinates>
+							-74.008100,40.714500,0
+							-74.006300,40.714200,0
+							-74.005600,40.713400,0
+							-74.006900,40.712600,0
+							-74.008300,40.713200,0
+							-74.008100,40.714500,0
+						</coordinates>
+					</LinearRing>
+				</outerBoundaryIs>
+			</Polygon>
+		</Placemark>
+	</Document>
+</kml> 

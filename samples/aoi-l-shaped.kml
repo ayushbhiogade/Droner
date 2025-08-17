@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+	<Document>
+		<name>AOI - L Shaped</name>
+		<Placemark>
+			<name>L-Shaped AOI</name>
+			<Style>
+				<LineStyle>
+					<color>ff22bb22</color>
+					<width>2</width>
+				</LineStyle>
+				<PolyStyle>
+					<color>4d22bb22</color>
+				</PolyStyle>
+			</Style>
+			<Polygon>
+				<outerBoundaryIs>
+					<LinearRing>
+						<coordinates>
+							-74.008000,40.714300,0
+							-74.005500,40.714300,0
+							-74.005500,40.713800,0
+							-74.006800,40.713800,0
+							-74.006800,40.712600,0
+							-74.008000,40.712600,0
+							-74.008000,40.714300,0
+						</coordinates>
+					</LinearRing>
+				</outerBoundaryIs>
+			</Polygon>
+		</Placemark>
+	</Document>
+</kml> 
