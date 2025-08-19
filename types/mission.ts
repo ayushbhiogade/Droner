@@ -34,6 +34,9 @@ export interface MissionParameters {
   sideOverlap: number // percentage
   droneSpeed: number // m/s
   maxBatteryTime: number // minutes
+  manualHeading?: boolean // whether to use manual heading override
+  customHeading?: number // degrees (0-359), only used when manualHeading is true
+  customTurnRadius?: number // meters, optional override for turn radius calculation
 }
 
 export interface MissionData {

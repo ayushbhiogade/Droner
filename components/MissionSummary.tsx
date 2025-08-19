@@ -1,8 +1,8 @@
 'use client'
 
-import { Download, FileText, Map } from 'lucide-react'
+import { Download, FileText, Map, Archive } from 'lucide-react'
 import { MissionData, FlightPlan } from '@/types/mission'
-import { generateKMLExport, generateCSVExport } from '@/utils/exportUtils'
+import { generateCSVExport, generateDJIWPMLRaw, generateDJITemplateKML, generateDJIWPMLKMZ } from '@/utils/exportUtils'
 
 interface MissionSummaryProps {
   flightPlan: FlightPlan
@@ -10,18 +10,44 @@ interface MissionSummaryProps {
 }
 
 export default function MissionSummary({ flightPlan, missionData }: MissionSummaryProps) {
-  const handleDownloadKML = () => {
-    const kmlContent = generateKMLExport(flightPlan, missionData)
+  const handleDownloadStandardKML = () => {
+    const kmlContent = generateDJITemplateKML(flightPlan, missionData)
     downloadFile(kmlContent, 'flight-plan.kml', 'application/vnd.google-earth.kml+xml')
   }
+
+  // DroneDeploy KML export removed
 
   const handleDownloadCSV = () => {
     const csvContent = generateCSVExport(flightPlan, missionData)
     downloadFile(csvContent, 'waypoints.csv', 'text/csv')
   }
 
+  // KMZ (Locked) export removed
+
+  // DJI Waylines KMZ export removed (use WPML Raw if needed)
+
+  const handleDownloadDJIWPMLRaw = () => {
+    const wpml = generateDJIWPMLRaw(flightPlan, missionData)
+    const currentDate = new Date().toISOString().split('T')[0]
+    downloadFile(wpml, `missions-${currentDate}.wpml`, 'application/xml')
+  }
+
+  const getDroneModelFromSpecs = (droneSpecs: any): string => {
+    if (droneSpecs.sensor.width === 13.2 && droneSpecs.focalLength === 8.8) {
+      return "DJI-Phantom-4-Pro"
+    } else if (droneSpecs.sensor.width === 17.3 && droneSpecs.focalLength === 24) {
+      return "DJI-Matrice-4E"
+    } else {
+      return "DJI-Phantom-4-Pro"
+    }
+  }
+
   const downloadFile = (content: string, filename: string, mimeType: string) => {
     const blob = new Blob([content], { type: mimeType })
+    downloadBlob(blob, filename)
+  }
+
+  const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
@@ -30,6 +56,17 @@ export default function MissionSummary({ flightPlan, missionData }: MissionSumma
     link.click()
     document.body.removeChild(link)
     URL.revokeObjectURL(url)
+  }
+
+  const handleDownloadWaylinesKMZ = async () => {
+    try {
+      const kmz = await generateDJIWPMLKMZ(flightPlan, missionData)
+      const currentDate = new Date().toISOString().split('T')[0]
+      downloadBlob(kmz, `DJI-Waylines-${currentDate}.kmz`)
+    } catch (e) {
+      console.error(e)
+      alert('Failed to build KMZ')
+    }
   }
 
   return (
@@ -110,13 +147,28 @@ export default function MissionSummary({ flightPlan, missionData }: MissionSumma
 
       <div>
         <h3 className="text-lg font-medium text-gray-700 mb-3">Export Flight Plan</h3>
-        <div className="flex flex-col sm:flex-row gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           <button
-            onClick={handleDownloadKML}
+            onClick={handleDownloadWaylinesKMZ}
             className="btn-primary flex items-center justify-center space-x-2"
           >
+            <Archive className="w-4 h-4" />
+            <span>DJI Waylines KMZ</span>
+          </button>
+          <button
+            onClick={handleDownloadStandardKML}
+            className="btn-secondary flex items-center justify-center space-x-2"
+          >
             <Map className="w-4 h-4" />
-            <span>Download KML</span>
+            <span>Standard KML</span>
+          </button>
+
+          <button
+            onClick={handleDownloadDJIWPMLRaw}
+            className="btn-secondary flex items-center justify-center space-x-2"
+          >
+            <FileText className="w-4 h-4" />
+            <span>DJI WPML (Raw)</span>
           </button>
           
           <button
@@ -124,14 +176,15 @@ export default function MissionSummary({ flightPlan, missionData }: MissionSumma
             className="btn-secondary flex items-center justify-center space-x-2"
           >
             <FileText className="w-4 h-4" />
-            <span>Download CSV</span>
+            <span>CSV Data</span>
           </button>
         </div>
         
         <div className="mt-3 text-xs text-gray-500">
-          <p>• KML: Flight lines for visualization in Google Earth or GIS software</p>
-          <p>• CSV: Waypoint coordinates for use in third-party mission execution tools</p>
+          <p>• Standard KML: DJI-style template with mission parameters embedded</p>
+          <p>• CSV: Waypoint coordinates for third-party mission execution tools</p>
         </div>
+        {/* Removed DroneDeploy/KMZ helper box */}
       </div>
     </div>
   )

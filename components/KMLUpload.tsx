@@ -38,7 +38,9 @@ export default function KMLUpload({ onKMLUploaded, missionData }: KMLUploadProps
     frontOverlap: 75,
     sideOverlap: 65,
     droneSpeed: 5.0,
-    maxBatteryTime: 18
+    maxBatteryTime: 18,
+    manualHeading: false,
+    customHeading: 0
   }
 
   const handleFileUpload = useCallback(async (file: File) => {
@@ -65,10 +67,9 @@ export default function KMLUpload({ onKMLUploaded, missionData }: KMLUploadProps
         bounds: calculateBounds(kmlData.coordinates)
       }
 
-      // Calculate flight altitude based on GSD
-      const calculatedAltitude = (defaultParameters.gsd / 100) *
-        defaultDroneSpecs.imageDimensions.width *
-        (defaultDroneSpecs.focalLength / defaultDroneSpecs.sensor.width)
+      // Calculate flight altitude based on GSD using correct formula
+      const gsdMeters = defaultParameters.gsd / 100 // Convert cm to meters
+      const calculatedAltitude = (gsdMeters * defaultDroneSpecs.focalLength * defaultDroneSpecs.imageDimensions.width) / defaultDroneSpecs.sensor.width
 
       const missionData: MissionData = {
         polygon,

@@ -248,15 +248,48 @@ export function generateFlightLines(
   const perpHeading = (heading + 90) % 360
   
   // Calculate the coverage width needed (perpendicular to flight direction)
-  const coverageWidth = Math.max(
-    calculateDistance({ lat: north, lng: west }, { lat: north, lng: east }),
-    calculateDistance({ lat: north, lng: west }, { lat: south, lng: west })
-  )
+  const eastWestWidth = calculateDistance({ lat: north, lng: west }, { lat: north, lng: east })
+  const northSouthWidth = calculateDistance({ lat: north, lng: west }, { lat: south, lng: west })
+  
+  // For different headings, the perpendicular coverage width changes
+  let coverageWidth: number
+  if (heading === 0 || heading === 180) {
+    // Flying north-south → coverage width is east-west
+    coverageWidth = eastWestWidth
+  } else {
+    // Flying east-west → coverage width is north-south
+    coverageWidth = northSouthWidth
+  }
+  
+  console.log('Coverage width calculation:', {
+    heading,
+    eastWestWidth,
+    northSouthWidth,
+    selectedCoverageWidth: coverageWidth
+  })
   
   console.log('Coverage calculations:', {
     coverageWidth,
     perpHeading
   })
+  
+  // Handle narrow areas where line spacing might be larger than coverage width
+  if (lineSpacing >= coverageWidth) {
+    console.warn(`Line spacing (${lineSpacing.toFixed(1)}m) is larger than coverage width (${coverageWidth.toFixed(1)}m). Using single center line.`)
+    
+    // For very narrow areas, use a single center line
+    const adjustedLineSpacing = lineSpacing
+    const numLines = 1
+    
+    console.log('Narrow area - single line approach:', {
+      lineSpacing,
+      adjustedLineSpacing,
+      numLines,
+      coverageWidth
+    })
+    
+    return generateSingleCenterLine(polygon, heading)
+  }
   
   // Ensure lineSpacing is reasonable to prevent excessive lines
   // For very small GSD values, cap the minimum line spacing to prevent impractical flight plans
@@ -381,6 +414,58 @@ export function generateFlightLines(
   })
   
   return flightLines
+}
+
+// Generate a single center line for very narrow areas
+function generateSingleCenterLine(polygon: Polygon, heading: number): Coordinate[][] {
+  const { north, south, east, west } = polygon.bounds
+  
+  // Calculate center point of the polygon
+  const centerPoint = { 
+    lat: (north + south) / 2, 
+    lng: (east + west) / 2 
+  }
+  
+  // Calculate the line length needed to cover the polygon in the flight direction
+  let lineLengthMeters: number
+  if (heading === 0 || heading === 180) {
+    // Flying north-south → need to cover north-south distance
+    lineLengthMeters = calculateDistance({ lat: north, lng: west }, { lat: south, lng: west })
+  } else {
+    // Flying east-west → need to cover east-west distance
+    lineLengthMeters = calculateDistance({ lat: north, lng: west }, { lat: north, lng: east })
+  }
+  
+  // Add 20% buffer
+  const bufferedLength = lineLengthMeters * 1.2
+  const halfLength = bufferedLength / 2
+  
+  // Create a line through the center
+  const start = calculateOffsetPoint(centerPoint, (heading + 180) % 360, halfLength)
+  const end = calculateOffsetPoint(centerPoint, heading, halfLength)
+  
+  // Generate waypoints along the line
+  const waypointSpacing = Math.min(5, lineLengthMeters / 10) // Max 5m spacing
+  const waypoints = generateWaypointsAlongLine(start, end, waypointSpacing)
+  
+  // Filter waypoints that are inside the polygon
+  const rings = polygon.coordinates
+  const interiorWaypoints = waypoints.filter(wp => isPointInPolygonRings(wp, rings))
+  
+  console.log('Single center line generated:', {
+    totalWaypoints: waypoints.length,
+    interiorWaypoints: interiorWaypoints.length,
+    lineLengthMeters,
+    heading
+  })
+  
+  // Return the center line if it has enough waypoints
+  if (interiorWaypoints.length >= 2) {
+    return [interiorWaypoints]
+  } else {
+    console.warn('Single center line has insufficient waypoints inside polygon')
+    return []
+  }
 }
 
 // Generate parallel flight lines strictly within an area and additionally clipped by a master AOI
@@ -510,5 +595,162 @@ function generateWaypointsAlongLine(
     waypoints.push({ lat, lng })
   }
   
+  return waypoints
+}
+
+// Calculate optimal turn radius based on drone speed and banking angle
+export function calculateTurnRadius(droneSpeed: number, bankingAngle: number = 25): number {
+  // Standard turn radius formula: R = V² / (g * tan(θ))
+  // where V = velocity, g = gravity (9.81 m/s²), θ = banking angle
+  const g = 9.81 // gravity in m/s²
+  const bankingRadians = (bankingAngle * Math.PI) / 180
+  
+  const turnRadius = Math.pow(droneSpeed, 2) / (g * Math.tan(bankingRadians))
+  
+  // Apply safety margin and constraints for different drone types
+  const minRadius = Math.max(turnRadius * 1.2, 5) // Minimum 5m radius with 20% safety margin
+  const maxRadius = Math.min(minRadius, 50) // Maximum 50m to prevent excessively wide turns
+  
+  return maxRadius
+}
+
+// Generate optimized turn waypoints between two flight lines
+export function generateOptimizedTurn(
+  line1End: Coordinate,
+  line2Start: Coordinate,
+  line1Heading: number,
+  line2Heading: number,
+  turnRadius: number,
+  polygon: Polygon
+): Coordinate[] {
+  // Calculate the turn angle
+  let turnAngle = line2Heading - line1Heading
+  
+  // Normalize to [-180, 180]
+  while (turnAngle > 180) turnAngle -= 360
+  while (turnAngle < -180) turnAngle += 360
+  
+  // If it's a small turn (< 30°), use straight connection
+  if (Math.abs(turnAngle) < 30) {
+    return [line1End, line2Start]
+  }
+  
+  // For 180° turns (U-turns), create optimized arc
+  if (Math.abs(turnAngle) > 150) {
+    return generateUTurn(line1End, line2Start, turnRadius, line1Heading, polygon)
+  }
+  
+  // For other turns, create smooth arc
+  return generateSmoothTurn(line1End, line2Start, turnRadius, line1Heading, line2Heading, polygon)
+}
+
+// Generate U-turn waypoints that stay within polygon bounds
+function generateUTurn(
+  startPoint: Coordinate,
+  endPoint: Coordinate,
+  turnRadius: number,
+  heading: number,
+  polygon: Polygon
+): Coordinate[] {
+  const waypoints: Coordinate[] = [startPoint]
+  
+  // Calculate perpendicular direction for the turn
+  const perpHeading = (heading + 90) % 360
+  
+  // Determine turn direction based on which side keeps us more inside the polygon
+  const leftTurnCenter = calculateOffsetPoint(startPoint, perpHeading, turnRadius)
+  const rightTurnCenter = calculateOffsetPoint(startPoint, (perpHeading + 180) % 360, turnRadius)
+  
+  // Choose the turn center that keeps us more inside the polygon
+  const leftInside = isPointInPolygonRings(leftTurnCenter, polygon.coordinates)
+  const rightInside = isPointInPolygonRings(rightTurnCenter, polygon.coordinates)
+  
+  let turnCenter: Coordinate
+  let turnDirection: number // 1 for left, -1 for right
+  
+  if (leftInside && !rightInside) {
+    turnCenter = leftTurnCenter
+    turnDirection = 1
+  } else if (rightInside && !leftInside) {
+    turnCenter = rightTurnCenter
+    turnDirection = -1
+  } else {
+    // If both or neither are inside, choose the shorter path
+    const leftDistance = calculateDistance(leftTurnCenter, endPoint)
+    const rightDistance = calculateDistance(rightTurnCenter, endPoint)
+    
+    if (leftDistance < rightDistance) {
+      turnCenter = leftTurnCenter
+      turnDirection = 1
+    } else {
+      turnCenter = rightTurnCenter
+      turnDirection = -1
+    }
+  }
+  
+  // Generate arc waypoints (semicircle)
+  const numArcPoints = Math.max(6, Math.floor((Math.PI * turnRadius) / 10)) // One point per ~10m of arc
+  
+  for (let i = 1; i <= numArcPoints; i++) {
+    const angle = (i / numArcPoints) * Math.PI * turnDirection // Half circle
+    const arcHeading = heading + (angle * 180 / Math.PI)
+    const arcPoint = calculateOffsetPoint(turnCenter, arcHeading, turnRadius)
+    
+    // Only add points that are inside the polygon
+    if (isPointInPolygonRings(arcPoint, polygon.coordinates)) {
+      waypoints.push(arcPoint)
+    }
+  }
+  
+  waypoints.push(endPoint)
+  return waypoints
+}
+
+// Generate smooth turn for non-U-turn scenarios
+function generateSmoothTurn(
+  startPoint: Coordinate,
+  endPoint: Coordinate,
+  turnRadius: number,
+  startHeading: number,
+  endHeading: number,
+  polygon: Polygon
+): Coordinate[] {
+  const waypoints: Coordinate[] = [startPoint]
+  
+  // For non-U-turns, use a simple curved path with 3-5 intermediate points
+  const numPoints = 3
+  const directDistance = calculateDistance(startPoint, endPoint)
+  
+  // If points are very close, just connect directly
+  if (directDistance < turnRadius) {
+    waypoints.push(endPoint)
+    return waypoints
+  }
+  
+  // Create curved path by offsetting intermediate points
+  for (let i = 1; i < numPoints; i++) {
+    const ratio = i / numPoints
+    
+    // Linear interpolation between start and end
+    const linearPoint: Coordinate = {
+      lat: startPoint.lat + (endPoint.lat - startPoint.lat) * ratio,
+      lng: startPoint.lng + (endPoint.lng - startPoint.lng) * ratio
+    }
+    
+    // Add slight curve offset
+    const curveOffset = Math.sin(ratio * Math.PI) * (turnRadius * 0.3)
+    const perpHeading = (startHeading + 90) % 360
+    const curvedPoint = calculateOffsetPoint(linearPoint, perpHeading, curveOffset)
+    
+    // Only add if inside polygon
+    if (isPointInPolygonRings(curvedPoint, polygon.coordinates)) {
+      waypoints.push(curvedPoint)
+    } else {
+      // Fall back to linear point if curved point is outside
+      waypoints.push(linearPoint)
+    }
+  }
+  
+  waypoints.push(endPoint)
   return waypoints
 } 

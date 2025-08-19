@@ -28,16 +28,14 @@ export default function Home() {
     
     try {
       console.log('Starting flight plan generation with data:', data)
-      console.log('Polygon bounds:', data.polygon.bounds)
-      console.log('Parameters:', data.parameters)
       
       // Generate the actual flight plan using the engine
       const generatedPlan = generateFlightPlan(data)
       
-      console.log('Flight plan generated successfully:', generatedPlan)
+      console.log('✅ Flight plan generated successfully:', generatedPlan)
       handleFlightPlanGenerated(generatedPlan)
     } catch (error) {
-      console.error('Failed to generate flight plan:', error)
+      console.error('❌ Failed to generate flight plan:', error)
       // You could add error handling UI here
       alert('Failed to generate flight plan. Check console for details.')
     } finally {

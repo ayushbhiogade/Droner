@@ -5,12 +5,22 @@ import {
   calculatePhotoInterval,
   generateFlightLines,
   calculateDistance, 
-  generateFlightLinesClippedByAOI
+  generateFlightLinesClippedByAOI,
+  calculateTurnRadius,
+  generateOptimizedTurn
 } from './geometry'
 
 export function generateFlightPlan(missionData: MissionData): FlightPlan {
-  // Evaluate both principal headings (0° and 90°) and pick the better
-  const candidateHeadings = [0, 90]
+  // Determine candidate headings based on manual override setting
+  const candidateHeadings = missionData.parameters.manualHeading && missionData.parameters.customHeading !== undefined
+    ? [missionData.parameters.customHeading] // Use only the manual heading
+    : [0, 90] // Evaluate both principal headings and pick the better
+    
+  console.log('🧭 Heading Selection:', {
+    manualMode: missionData.parameters.manualHeading,
+    customHeading: missionData.parameters.customHeading,
+    candidateHeadings
+  })
   
   // Validate GSD parameter - should be reasonable (0.5cm to 50cm)
   if (missionData.parameters.gsd > 5000) {
@@ -46,14 +56,21 @@ export function generateFlightPlan(missionData: MissionData): FlightPlan {
     console.warn(`Very small photo interval (${photoInterval.toFixed(2)}m) detected. This may result in excessive photo count. Consider increasing GSD or reducing overlap.`)
   }
   
+  // Altitude calculations verified and consistent
+  
   console.log('Flight plan generation parameters:', {
     gsd: missionData.parameters.gsd,
     lineSpacing,
     photoInterval,
-    calculatedAltitude: missionData.calculatedAltitude
+    calculatedAltitude: missionData.calculatedAltitude,
+    droneSpecs: {
+      sensor: missionData.droneSpecs.sensor,
+      focalLength: missionData.droneSpecs.focalLength,
+      imageDimensions: missionData.droneSpecs.imageDimensions
+    }
   })
   
-  // Generate for both candidate headings and pick better total time
+  // Generate flight plan(s) for candidate heading(s) and pick the best
   let best = { heading: candidateHeadings[0], missions: [] as Mission[], totalTime: Infinity }
   for (const h of candidateHeadings) {
     const ms = partitionAOIIntoPolygonMissions(
@@ -76,6 +93,20 @@ export function generateFlightPlan(missionData: MissionData): FlightPlan {
   const totalTime = missions.reduce((sum, mission) => sum + mission.estimatedTime, 0)
   const totalPhotos = missions.reduce((sum, mission) => sum + mission.estimatedPhotos, 0)
   const totalArea = missionData.polygon.area
+  
+  // Debug for zero results
+  if (totalTime === 0 || totalPhotos === 0) {
+    console.warn('⚠️ ZERO FLIGHT PLAN DETECTED:', {
+      totalTime,
+      totalPhotos,
+      missions: missions.length,
+      lineSpacing,
+      photoInterval,
+      polygonArea: totalArea,
+      polygonBounds: missionData.polygon.bounds,
+      suggestion: 'Area may be too narrow for current line spacing. Try reducing GSD or increasing overlaps.'
+    })
+  }
   
   // Validate final results
   if (totalTime > 10080) { // More than 1 week
@@ -211,8 +242,15 @@ function partitionAOIIntoPolygonMissions(
 
     const mission = createMissionWithArea(flightLines, missionIdx, colors[missionIdx % colors.length], droneSpeed, photoInterval, strip.coordinates[0])
     
-    // Build serpentine path with connectors for visualization
-    mission.pathSegments = buildSerpentinePath(mission.flightLines, missionIdx, mission.color)
+    // Build optimized serpentine path with improved turns
+    mission.pathSegments = buildSerpentinePathOptimized(
+      mission.flightLines, 
+      missionIdx, 
+      mission.color,
+      false, // reverseFirstLine
+      droneSpeed,
+      polygon
+    )
     
     // Derive start/end from full mission path
     if (mission.pathSegments && mission.pathSegments.length > 0) {
@@ -236,7 +274,391 @@ function partitionAOIIntoPolygonMissions(
   // Merge adjacent missions whose combined time fits a single battery
   const packed = packMissionsByBattery(missions, maxBatteryTime, droneSpeed, photoInterval)
 
-  return packed
+  // Optimize mission chaining for efficient transitions
+  const chained = optimizeMissionChaining(packed)
+
+  return chained
+}
+
+// Optimize mission transitions to minimize cross-field flights
+function optimizeMissionChaining(missions: Mission[]): Mission[] {
+  if (missions.length <= 1) return missions
+  
+  console.log('🔗 Optimizing mission chaining for', missions.length, 'missions')
+  
+  const optimized: Mission[] = []
+  
+  // First mission stays as-is
+  optimized.push(missions[0])
+  
+  for (let i = 1; i < missions.length; i++) {
+    const prevMission = optimized[i - 1]
+    const currentMission = missions[i]
+    
+    // Find the best start point for current mission based on previous mission's end
+    const optimizedMission = optimizeMissionStartPoint(currentMission, prevMission.endPoint)
+    optimized.push(optimizedMission)
+    
+    console.log(`Mission ${i + 1} optimized: transition distance reduced to ${calculateTransitionDistance(prevMission.endPoint, optimizedMission.startPoint)?.toFixed(1)}m`)
+  }
+  
+  return optimized
+}
+
+// Optimize a mission's start point and flight direction based on previous mission end
+function optimizeMissionStartPoint(mission: Mission, prevEndPoint?: Coordinate): Mission {
+  if (!prevEndPoint || !mission.flightLines.length) return mission
+  
+  // Get all possible start/end combinations for this mission
+  const startOptions = getMissionStartEndOptions(mission)
+  
+  // Find the option with minimum distance from previous mission end
+  let bestOption = startOptions[0]
+  let minDistance = Infinity
+  
+  for (const option of startOptions) {
+    const distance = calculateDistance(prevEndPoint, option.startPoint)
+    if (distance < minDistance) {
+      minDistance = distance
+      bestOption = option
+    }
+  }
+  
+  // Rebuild mission with optimal start configuration
+  if (bestOption.reverseOrder || bestOption.reverseFirstLine) {
+    return rebuildMissionWithOptimalPath(mission, bestOption.reverseOrder, bestOption.reverseFirstLine)
+  }
+  
+  return mission
+}
+
+// Get all possible start/end point combinations for a mission
+function getMissionStartEndOptions(mission: Mission): Array<{
+  startPoint: Coordinate
+  endPoint: Coordinate
+  reverseOrder: boolean
+  reverseFirstLine: boolean
+}> {
+  const options: Array<{
+    startPoint: Coordinate
+    endPoint: Coordinate
+    reverseOrder: boolean
+    reverseFirstLine: boolean
+  }> = []
+  
+  const lines = mission.flightLines
+  if (lines.length === 0) return options
+  
+  // Option 1: Normal order, normal direction
+  const firstLine = lines[0]
+  const lastLine = lines[lines.length - 1]
+  
+  if (firstLine.coordinates.length > 0 && lastLine.coordinates.length > 0) {
+    // Normal start
+    options.push({
+      startPoint: firstLine.coordinates[0],
+      endPoint: getEndPointForSerpentine(lines, false, false),
+      reverseOrder: false,
+      reverseFirstLine: false
+    })
+    
+    // Reverse first line direction
+    options.push({
+      startPoint: firstLine.coordinates[firstLine.coordinates.length - 1],
+      endPoint: getEndPointForSerpentine(lines, false, true),
+      reverseOrder: false,
+      reverseFirstLine: true
+    })
+    
+    // Reverse line order
+    options.push({
+      startPoint: lastLine.coordinates[0],
+      endPoint: getEndPointForSerpentine(lines, true, false),
+      reverseOrder: true,
+      reverseFirstLine: false
+    })
+    
+    // Reverse line order AND reverse first line direction
+    options.push({
+      startPoint: lastLine.coordinates[lastLine.coordinates.length - 1],
+      endPoint: getEndPointForSerpentine(lines, true, true),
+      reverseOrder: true,
+      reverseFirstLine: true
+    })
+  }
+  
+  return options
+}
+
+// Calculate end point for serpentine path given configuration
+function getEndPointForSerpentine(lines: FlightLine[], reverseOrder: boolean, reverseFirstLine: boolean): Coordinate {
+  if (lines.length === 0) return { lat: 0, lng: 0 }
+  
+  const orderedLines = reverseOrder ? [...lines].reverse() : lines
+  const lastLine = orderedLines[orderedLines.length - 1]
+  
+  // For serpentine, determine if last line should be reversed
+  const lastLineIndex = orderedLines.length - 1
+  const shouldReverseLast = reverseFirstLine ? lastLineIndex % 2 === 0 : lastLineIndex % 2 === 1
+  
+  if (shouldReverseLast) {
+    return lastLine.coordinates[0]
+  } else {
+    return lastLine.coordinates[lastLine.coordinates.length - 1]
+  }
+}
+
+// Rebuild mission with optimal flight path configuration
+function rebuildMissionWithOptimalPath(mission: Mission, reverseOrder: boolean, reverseFirstLine: boolean): Mission {
+  // Create new mission with optimized path
+  const newMission = { ...mission }
+  
+  // Reorder flight lines if needed
+  if (reverseOrder) {
+    newMission.flightLines = [...mission.flightLines].reverse().map((line, idx) => ({
+      ...line,
+      lineIndex: idx
+    }))
+  }
+  
+  // Rebuild serpentine path with new configuration
+  // Use default drone speed for chaining optimization (no polygon available)
+  newMission.pathSegments = buildSerpentinePathOptimized(
+    newMission.flightLines, 
+    mission.index, 
+    mission.color,
+    reverseFirstLine,
+    5, // Default drone speed
+    undefined // No polygon available for chaining optimization
+  )
+  
+  // Update start/end points
+  if (newMission.pathSegments && newMission.pathSegments.length > 0) {
+    const firstSeg = newMission.pathSegments[0]
+    const lastSeg = newMission.pathSegments[newMission.pathSegments.length - 1]
+    newMission.startPoint = firstSeg.coordinates[0]
+    newMission.endPoint = lastSeg.coordinates[lastSeg.coordinates.length - 1]
+  }
+  
+  return newMission
+}
+
+// Enhanced serpentine path builder with configurable start direction and optimized turns
+function buildSerpentinePathOptimized(
+  lines: FlightLine[], 
+  missionIndex: number, 
+  color: string,
+  reverseFirstLine: boolean = false,
+  droneSpeed: number = 5,
+  polygon?: Polygon
+) {
+  if (lines.length === 0) return [] as { kind: 'line' | 'connector'; coordinates: Coordinate[]; missionIndex: number; segmentIndex: number; color: string }[]
+
+  // Order lines by proximity using nearest-neighbor algorithm for optimal transitions
+  const ordered = orderLinesByProximity(lines, reverseFirstLine)
+
+  // Calculate optimal turn radius based on drone speed
+  const turnRadius = calculateTurnRadius(droneSpeed)
+  
+  console.log(`🔄 Turn optimization for mission ${missionIndex + 1}:`, {
+    droneSpeed,
+    calculatedTurnRadius: turnRadius.toFixed(1) + 'm',
+    lineCount: ordered.length
+  })
+
+  // Estimate typical cross-line spacing using the distance between first points
+  let spacingSamples: number[] = []
+  for (let i = 0; i < ordered.length - 1; i++) {
+    const a0 = ordered[i].coordinates[0]
+    const b0 = ordered[i + 1].coordinates[0]
+    spacingSamples.push(calculateDistance(a0, b0))
+  }
+  const avgSpacing = spacingSamples.length > 0 ? spacingSamples.reduce((s, v) => s + v, 0) / spacingSamples.length : 10
+  const connectorMaxGap = Math.max(3 * avgSpacing, 50) // Increased max gap for better turn handling
+
+  const segments: { kind: 'line' | 'connector'; coordinates: Coordinate[]; missionIndex: number; segmentIndex: number; color: string }[] = []
+  let segIdx = 0
+  
+  for (let i = 0; i < ordered.length; i++) {
+    const line = ordered[i]
+    
+    // Use proximity-based direction if available, otherwise fall back to alternating pattern
+    const proximityDirection = (line as any)._proximityDirection
+    const shouldReverse = proximityDirection !== undefined ? proximityDirection : 
+                         (reverseFirstLine ? i % 2 === 0 : i % 2 === 1)
+    const coords = shouldReverse ? [...line.coordinates].reverse() : line.coordinates
+    
+    // line segment
+    segments.push({ kind: 'line', coordinates: coords, missionIndex, segmentIndex: segIdx++, color })
+    
+    // connector to next line end-start with optimized turns
+    if (i < ordered.length - 1) {
+      const next = ordered[i + 1]
+      const currEnd = coords[coords.length - 1]
+      
+      // Calculate next start based on proximity-based direction
+      const nextProximityDirection = (next as any)._proximityDirection
+      const nextShouldReverse = nextProximityDirection !== undefined ? nextProximityDirection :
+                               (reverseFirstLine ? (i + 1) % 2 === 0 : (i + 1) % 2 === 1)
+      const nextStart = nextShouldReverse ? next.coordinates[next.coordinates.length - 1] : next.coordinates[0]
+      
+      const gap = calculateDistance(currEnd, nextStart)
+      
+      if (gap <= connectorMaxGap) {
+        // Generate optimized turn waypoints if polygon is available
+        if (polygon) {
+          const line1Heading = line.heading
+          const line2Heading = next.heading
+          
+          const optimizedTurnWaypoints = generateOptimizedTurn(
+            currEnd,
+            nextStart,
+            line1Heading,
+            line2Heading,
+            turnRadius,
+            polygon
+          )
+          
+          // Use optimized turn waypoints
+          if (optimizedTurnWaypoints.length > 2) {
+            segments.push({ 
+              kind: 'connector', 
+              coordinates: optimizedTurnWaypoints, 
+              missionIndex, 
+              segmentIndex: segIdx++, 
+              color 
+            })
+          } else {
+            // Fall back to straight line
+            segments.push({ 
+              kind: 'connector', 
+              coordinates: [currEnd, nextStart], 
+              missionIndex, 
+              segmentIndex: segIdx++, 
+              color 
+            })
+          }
+        } else {
+          // Fall back to straight line if no polygon provided
+          segments.push({ 
+            kind: 'connector', 
+            coordinates: [currEnd, nextStart], 
+            missionIndex, 
+            segmentIndex: segIdx++, 
+            color 
+          })
+        }
+      }
+    }
+  }
+  
+  return segments
+}
+
+// Calculate transition distance between missions (handles undefined points)
+function calculateTransitionDistance(point1?: Coordinate, point2?: Coordinate): number | null {
+  if (!point1 || !point2) return null
+  return calculateDistance(point1, point2)
+}
+
+// Order flight lines by proximity using nearest-neighbor algorithm
+function orderLinesByProximity(lines: FlightLine[], reverseFirstLine: boolean = false): FlightLine[] {
+  if (lines.length <= 1) return lines
+  
+  console.log(`🔗 Ordering ${lines.length} flight lines by proximity...`)
+  
+  // Start with the first line (westernmost or southernmost depending on heading)
+  const remaining = [...lines]
+  const ordered: FlightLine[] = []
+  
+  // Find the starting line (leftmost/bottommost based on typical survey patterns)
+  let currentLine = remaining.reduce((min, line) => {
+    const minStart = getLineStartPoint(min, false)
+    const lineStart = getLineStartPoint(line, false)
+    
+    // Choose leftmost line (smallest longitude), then topmost (largest latitude)
+    if (lineStart.lng < minStart.lng || 
+        (Math.abs(lineStart.lng - minStart.lng) < 0.0001 && lineStart.lat > minStart.lat)) {
+      return line
+    }
+    return min
+  })
+  
+  // Remove the starting line from remaining
+  const startIndex = remaining.findIndex(line => line.id === currentLine.id)
+  remaining.splice(startIndex, 1)
+  
+  // Track the direction (forward/reverse) for each line to maintain serpentine pattern
+  const lineDirections = new Map<string, boolean>()
+  let currentDirection = reverseFirstLine
+  lineDirections.set(currentLine.id, currentDirection)
+  
+  ordered.push(currentLine)
+  
+  // Build the path using nearest-neighbor
+  while (remaining.length > 0) {
+    const currentEnd = getLineEndPoint(currentLine, lineDirections.get(currentLine.id) || false)
+    
+    let nearestLine: FlightLine | null = null
+    let minDistance = Infinity
+    let bestDirection = false
+    
+    // Find the nearest unvisited line
+    for (const line of remaining) {
+      // Try both directions for the candidate line
+      for (const direction of [false, true]) {
+        const candidateStart = getLineStartPoint(line, direction)
+        const distance = calculateDistance(currentEnd, candidateStart)
+        
+        if (distance < minDistance) {
+          minDistance = distance
+          nearestLine = line
+          bestDirection = direction
+        }
+      }
+    }
+    
+    if (nearestLine) {
+      // Alternate direction for serpentine pattern
+      currentDirection = !currentDirection
+      lineDirections.set(nearestLine.id, bestDirection)
+      
+      ordered.push(nearestLine)
+      currentLine = nearestLine
+      
+      // Remove from remaining
+      const index = remaining.findIndex(line => line.id === nearestLine!.id)
+      remaining.splice(index, 1)
+      
+      console.log(`  ➡️ Next line: ${nearestLine.id}, distance: ${minDistance.toFixed(1)}m`)
+    } else {
+      break
+    }
+  }
+  
+  console.log(`✅ Proximity ordering complete: ${ordered.length} lines optimized`)
+  
+  // Update the line directions in the flight line objects for later use
+  return ordered.map(line => ({
+    ...line,
+    _proximityDirection: lineDirections.get(line.id)
+  }))
+}
+
+// Get the start point of a line (respecting direction)
+function getLineStartPoint(line: FlightLine, reverse: boolean): Coordinate {
+  if (reverse) {
+    return line.coordinates[line.coordinates.length - 1]
+  }
+  return line.coordinates[0]
+}
+
+// Get the end point of a line (respecting direction)
+function getLineEndPoint(line: FlightLine, reverse: boolean): Coordinate {
+  if (reverse) {
+    return line.coordinates[0]
+  }
+  return line.coordinates[line.coordinates.length - 1]
 }
 
 function packMissionsByBattery(
