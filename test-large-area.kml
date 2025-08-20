@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>Large Test Area - 6698 Acres</name>
+    <description>Large rectangular area for testing mission partitioning</description>
+    <Placemark>
+      <name>Large Test Area</name>
+      <description>Large rectangular area approximately 6698 acres</description>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>
+              -74.0000,40.7000,0
+              -73.9000,40.7000,0
+              -73.9000,40.8000,0
+              -74.0000,40.8000,0
+              -74.0000,40.7000,0
+            </coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>
