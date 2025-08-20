@@ -15,17 +15,27 @@ export async function parseKML(file: File): Promise<KMLData> {
         
         const result = parser.parse(content)
         
+        console.log('📁 KML file loaded, parsing structure...')
+        
         // Extract coordinates from KML structure
         const coordinates = extractCoordinates(result)
+        
+        console.log(`📊 KML parsing results: ${coordinates.length} coordinates found`)
+        console.log('📍 First few coordinates:', coordinates.slice(0, 3))
         
         if (coordinates.length === 0) {
           reject(new Error('No valid coordinates found in KML file'))
           return
         }
         
+        const name = extractName(result)
+        const description = extractDescription(result)
+        
+        console.log(`📋 KML metadata: name="${name}", description="${description}"`)
+        
         resolve({
-          name: extractName(result),
-          description: extractDescription(result),
+          name,
+          description,
           coordinates
         })
       } catch (error) {
@@ -88,23 +98,58 @@ function findPlacemarks(kmlData: any): any[] {
 
 function parseCoordinateString(coordString: string): Coordinate[] {
   const coordinates: Coordinate[] = []
-  const lines = coordString.trim().split('\n')
   
-  for (const line of lines) {
-    const trimmedLine = line.trim()
-    if (trimmedLine) {
-      const parts = trimmedLine.split(',').map(part => part.trim())
+  // Handle both newline-separated and space-separated coordinate formats
+  let coordPairs: string[]
+  if (coordString.includes('\n')) {
+    coordPairs = coordString.trim().split('\n')
+  } else {
+    // Split by spaces for coordinates on the same line
+    coordPairs = coordString.trim().split(/\s+/)
+  }
+  
+  console.log('🔍 Raw coordinate string:', coordString)
+  console.log('🔍 Found coordinate pairs:', coordPairs.length)
+  
+  // Your KML file uses longitude,latitude format (KML standard)
+  // First number is longitude, second number is latitude
+  const isLatLngFormat = false
+  console.log('🔍 Using coordinate format: longitude,latitude (KML standard)')
+  
+  // Parse all coordinates using the detected format
+  for (const pair of coordPairs) {
+    const trimmedPair = pair.trim()
+    if (trimmedPair) {
+      const parts = trimmedPair.split(',').map((part: string) => part.trim())
       if (parts.length >= 2) {
-        const lng = parseFloat(parts[0])
-        const lat = parseFloat(parts[1])
+        let lat: number, lng: number
+        
+        if (isLatLngFormat) {
+          // Format: latitude,longitude
+          lat = parseFloat(parts[0])
+          lng = parseFloat(parts[1])
+        } else {
+          // Format: longitude,latitude (KML standard)
+          lng = parseFloat(parts[0])
+          lat = parseFloat(parts[1])
+        }
         
         if (!isNaN(lat) && !isNaN(lng)) {
-          coordinates.push({ lat, lng })
+          // Validate coordinate ranges
+          if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
+            coordinates.push({ lat, lng })
+            console.log(`✅ Added coordinate: lat=${lat}, lng=${lng}`)
+          } else {
+            console.warn(`⚠️ Invalid coordinates: lat=${lat}, lng=${lng}`)
+          }
+        } else {
+          console.warn(`⚠️ Failed to parse coordinates from: ${trimmedPair}`)
         }
       }
     }
   }
   
+  console.log(`📍 Parsed ${coordinates.length} coordinates`)
   return coordinates
 }
 

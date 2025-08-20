@@ -121,6 +121,10 @@ export default function FlightPlanMap({ missionData, flightPlan }: FlightPlanMap
   const addAOIPolygon = (polygon: MissionData['polygon']) => {
     if (!map.current) return
 
+    console.log('🗺️ Adding AOI polygon to map:', polygon)
+    console.log('📍 Polygon coordinates:', polygon.coordinates[0])
+    console.log('📍 First coordinate:', polygon.coordinates[0][0])
+
     // Add polygon source
     map.current.addSource('aoi-polygon', {
       type: 'geojson',
@@ -353,6 +357,9 @@ export default function FlightPlanMap({ missionData, flightPlan }: FlightPlanMap
 
   const fitMapToBounds = (bounds: MissionData['polygon']['bounds']) => {
     if (!map.current) return
+
+    console.log('🗺️ Fitting map to bounds:', bounds)
+    console.log('📍 Bounds: west=', bounds.west, 'east=', bounds.east, 'south=', bounds.south, 'north=', bounds.north)
 
     map.current.fitBounds([
       [bounds.west, bounds.south],

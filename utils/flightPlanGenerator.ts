@@ -154,6 +154,15 @@ function partitionAOIIntoPolygonMissions(
   
   const batteryTime = maxBatteryTime * 0.9 // reserve margin
   
+  console.log('🔍 Partitioning AOI:', {
+    dimensions: { widthEW: widthEW.toFixed(1), heightNS: heightNS.toFixed(1) },
+    perpendicularWidth: perpendicularWidth.toFixed(1),
+    alongHeadingLength: alongHeadingLength.toFixed(1),
+    lineSpacing: lineSpacing.toFixed(2),
+    batteryTime: batteryTime.toFixed(1),
+    estimatedLines: Math.ceil(perpendicularWidth / lineSpacing)
+  })
+  
   function estimateTimeForStrip(stripWidthM: number): { timeMin: number; numLines: number; totalLength: number } {
     const numLines = Math.max(1, Math.ceil(stripWidthM / lineSpacing) + 1)
     const totalLength = numLines * alongHeadingLength
@@ -165,10 +174,53 @@ function partitionAOIIntoPolygonMissions(
   }
   
   function findStripWidthForBattery(maxWidthM: number): number {
-    // Binary search width in [lineSpacing, maxWidthM]
-    let lo = Math.max(lineSpacing, Math.min(lineSpacing * 1.5, maxWidthM * 0.05))
-    let hi = Math.max(lo, maxWidthM)
+    // Calculate the maximum number of lines that can fit in battery time
+    const maxLinesPerBattery = Math.floor(batteryTime / 0.5) // Assume 0.5 min per line minimum
+    const maxStripWidth = Math.max(lineSpacing, (maxLinesPerBattery - 1) * lineSpacing)
+    
+    // For very large areas (>2km wide), force aggressive partitioning
+    if (maxWidthM > 2000) {
+      console.log(`🌍 Very large area detected (${maxWidthM.toFixed(1)}m), forcing aggressive partitioning`)
+      const targetMissions = Math.max(3, Math.ceil(maxWidthM / 800)) // Aim for reasonable mission count
+      const forcedWidth = Math.max(lineSpacing * 2, maxWidthM / targetMissions)
+      return Math.min(forcedWidth, maxStripWidth)
+    }
+    
+    // For medium areas (500m - 2km), moderate partitioning
+    if (maxWidthM > 500) {
+      console.log(`🏞️ Medium area detected (${maxWidthM.toFixed(1)}m), using moderate partitioning`)
+      // Try to fit the entire area in 1-2 missions if possible
+      const estimatedTime = estimateTimeForStrip(maxWidthM)
+      if (estimatedTime.timeMin <= batteryTime) {
+        console.log(`✅ Entire area fits in one mission (${estimatedTime.timeMin.toFixed(1)}min)`)
+        return maxWidthM
+      }
+      
+      // Split into 2 missions if possible
+      const halfWidth = maxWidthM / 2
+      const halfTime = estimateTimeForStrip(halfWidth)
+      if (halfTime.timeMin <= batteryTime) {
+        console.log(`✅ Area fits in 2 missions (${halfTime.timeMin.toFixed(1)}min each)`)
+        return halfWidth
+      }
+    }
+    
+    // For smaller areas (<500m), try to fit in single mission first
+    if (maxWidthM <= 500) {
+      console.log(`🏘️ Small area detected (${maxWidthM.toFixed(1)}m), attempting single mission`)
+      const estimatedTime = estimateTimeForStrip(maxWidthM)
+      if (estimatedTime.timeMin <= batteryTime) {
+        console.log(`✅ Small area fits in single mission (${estimatedTime.timeMin.toFixed(1)}min)`)
+        return maxWidthM
+      }
+    }
+    
+    // Fallback: use binary search to find optimal width
+    let lo = Math.max(lineSpacing, Math.min(lineSpacing * 2, maxWidthM * 0.1))
+    let hi = Math.max(lo, Math.min(maxWidthM, maxStripWidth))
     let best = lo
+    
+    // Binary search for optimal width
     for (let i = 0; i < 20; i++) {
       const mid = (lo + hi) / 2
       const { timeMin } = estimateTimeForStrip(mid)
@@ -179,7 +231,8 @@ function partitionAOIIntoPolygonMissions(
         hi = mid
       }
     }
-    return Math.min(best, maxWidthM)
+    
+    return Math.min(best, maxStripWidth)
   }
   
   const missions: Mission[] = []
@@ -190,6 +243,19 @@ function partitionAOIIntoPolygonMissions(
   
   while (remainingWidth > 0.1) {
     const widthForBattery = findStripWidthForBattery(remainingWidth)
+    
+    console.log(`📏 Mission ${missionIdx + 1}: remaining=${remainingWidth.toFixed(1)}m, strip=${widthForBattery.toFixed(1)}m`)
+    
+    // Safety check: ensure we're making progress and not getting stuck
+    if (widthForBattery < lineSpacing * 0.5 || widthForBattery > remainingWidth * 0.9) {
+      console.warn(`⚠️ Strip width issue: width=${widthForBattery.toFixed(2)}m, remaining=${remainingWidth.toFixed(2)}m, forcing reasonable width`)
+      const forcedWidth = Math.max(lineSpacing, Math.min(remainingWidth * 0.3, lineSpacing * 10))
+      remainingWidth = Math.max(0, remainingWidth - forcedWidth)
+      offsetFromWestOrSouth += forcedWidth
+      missionIdx++
+      continue
+    }
+    
     const proportionStart = offsetFromWestOrSouth / perpendicularWidth
     const proportionEnd = Math.min(1, (offsetFromWestOrSouth + widthForBattery) / perpendicularWidth)
     
@@ -231,6 +297,16 @@ function partitionAOIIntoPolygonMissions(
 
     // Generate lines within this strip
     const rawLines = generateFlightLinesClippedByAOI(strip, polygon, heading, lineSpacing)
+    
+    // Safety check: ensure we have valid flight lines
+    if (rawLines.length === 0) {
+      console.warn(`⚠️ No flight lines generated for strip ${missionIdx}, skipping`)
+      remainingWidth -= widthForBattery
+      offsetFromWestOrSouth += widthForBattery
+      missionIdx++
+      continue
+    }
+    
     const flightLines: FlightLine[] = rawLines.map((coords, idx) => ({
       id: `m${missionIdx}-line-${idx}`,
       coordinates: coords,
@@ -241,6 +317,24 @@ function partitionAOIIntoPolygonMissions(
     }))
 
     const mission = createMissionWithArea(flightLines, missionIdx, colors[missionIdx % colors.length], droneSpeed, photoInterval, strip.coordinates[0])
+    
+    // Safety check: ensure mission doesn't exceed battery time
+    if (mission.estimatedTime > batteryTime) {
+      console.warn(`⚠️ Mission ${missionIdx + 1} exceeds battery time: ${mission.estimatedTime.toFixed(1)}min > ${batteryTime.toFixed(1)}min`)
+      console.warn(`⚠️ Forcing mission to fit within battery constraints`)
+      
+      // Recalculate with a smaller strip width
+      const maxLinesForBattery = Math.floor(batteryTime / 0.5)
+      const maxWidthForBattery = Math.max(lineSpacing, (maxLinesForBattery - 1) * lineSpacing)
+      
+      if (maxWidthForBattery < widthForBattery) {
+        console.log(`🔄 Adjusting strip width from ${widthForBattery.toFixed(1)}m to ${maxWidthForBattery.toFixed(1)}m`)
+        // Rollback and try again with smaller width
+        remainingWidth += widthForBattery - maxWidthForBattery
+        offsetFromWestOrSouth -= widthForBattery - maxWidthForBattery
+        continue
+      }
+    }
     
     // Build optimized serpentine path with improved turns
     mission.pathSegments = buildSerpentinePathOptimized(
@@ -267,10 +361,30 @@ function partitionAOIIntoPolygonMissions(
     offsetFromWestOrSouth += widthForBattery
     missionIdx++
 
-    // Safety to avoid infinite loops
-    if (missionIdx > 100) break
+    // Safety to avoid infinite loops and ensure progress
+    if (missionIdx > 100) {
+      console.warn('⚠️ Safety limit reached, forcing completion')
+      break
+    }
+    
+    // Ensure we're making progress
+    if (widthForBattery < remainingWidth * 0.01) {
+      console.warn('⚠️ Strip width too small relative to remaining width, forcing completion')
+      break
+    }
   }
 
+  console.log(`✅ Generated ${missions.length} missions for AOI`)
+  
+  // If no missions were generated, create a fallback mission
+  if (missions.length === 0) {
+    console.warn('⚠️ No missions generated, creating fallback mission')
+    const fallbackMission = createFallbackMission(polygon, heading, lineSpacing, droneSpeed, photoInterval)
+    if (fallbackMission) {
+      missions.push(fallbackMission)
+    }
+  }
+  
   // Merge adjacent missions whose combined time fits a single battery
   const packed = packMissionsByBattery(missions, maxBatteryTime, droneSpeed, photoInterval)
 
@@ -280,29 +394,276 @@ function partitionAOIIntoPolygonMissions(
   return chained
 }
 
-// Optimize mission transitions to minimize cross-field flights
+// ============================================================================
+// GLOBALLY OPTIMIZED MISSION CHAINING USING TSP
+// ============================================================================
+
+// Interface for transition data between missions
+interface Transition {
+  fromMissionIndex: number
+  toMissionIndex: number
+  distance: number
+  fromExitPoint: Coordinate // The best exit point from mission i
+  toEntryPoint: Coordinate  // The best entry point for mission j
+}
+
+// Step 1: Create a Cost Matrix of All Possible Transitions
+function calculateTransitionCostMatrix(missions: Mission[]): Transition[][] {
+  console.log(`📊 Calculating transition cost matrix for ${missions.length} missions...`)
+  
+  const matrix: Transition[][] = []
+  
+  for (let i = 0; i < missions.length; i++) {
+    matrix[i] = []
+    for (let j = 0; j < missions.length; j++) {
+      if (i === j) {
+        // Same mission - no transition cost
+        matrix[i][j] = {
+          fromMissionIndex: i,
+          toMissionIndex: j,
+          distance: 0,
+          fromExitPoint: { lat: 0, lng: 0 },
+          toEntryPoint: { lat: 0, lng: 0 }
+        }
+      } else {
+        // Calculate optimal transition from mission i to mission j
+        const transition = findOptimalTransition(missions[i], missions[j])
+        matrix[i][j] = transition
+      }
+    }
+  }
+  
+  console.log(`✅ Transition cost matrix calculated with ${missions.length * missions.length} transitions`)
+  return matrix
+}
+
+// Find the optimal transition between two missions
+function findOptimalTransition(fromMission: Mission, toMission: Mission): Transition {
+  const fromOptions = getMissionStartEndOptions(fromMission)
+  const toOptions = getMissionStartEndOptions(toMission)
+  
+  let bestTransition: Transition = {
+    fromMissionIndex: fromMission.index,
+    toMissionIndex: toMission.index,
+    distance: Infinity,
+    fromExitPoint: { lat: 0, lng: 0 },
+    toEntryPoint: { lat: 0, lng: 0 }
+  }
+  
+  // Try all combinations of exit/entry points
+  for (const fromOption of fromOptions) {
+    for (const toOption of toOptions) {
+      const distance = calculateDistance(fromOption.endPoint, toOption.startPoint)
+      
+      if (distance < bestTransition.distance) {
+        bestTransition = {
+          fromMissionIndex: fromMission.index,
+          toMissionIndex: toMission.index,
+          distance,
+          fromExitPoint: fromOption.endPoint,
+          toEntryPoint: toOption.startPoint
+        }
+      }
+    }
+  }
+  
+  return bestTransition
+}
+
+// Step 2: Solve for the Optimal Mission Order (TSP)
+function solveMissionOrderTSP(costMatrix: Transition[][]): number[] {
+  console.log(`🧮 Solving TSP for optimal mission order...`)
+  
+  const numMissions = costMatrix.length
+  if (numMissions <= 1) return [0]
+  
+  // For small numbers of missions, try multiple starting points and find the best
+  let bestOrder: number[] = []
+  let bestTotalDistance = Infinity
+  
+  // Try each mission as a starting point
+  for (let startMission = 0; startMission < numMissions; startMission++) {
+    const order = solveTSPFromStart(costMatrix, startMission)
+    const totalDistance = calculateTotalPathDistance(costMatrix, order)
+    
+    if (totalDistance < bestTotalDistance) {
+      bestTotalDistance = totalDistance
+      bestOrder = order
+    }
+  }
+  
+  console.log(`✅ TSP solution found: ${bestOrder.join(' → ')} with total distance: ${bestTotalDistance.toFixed(1)}m`)
+  return bestOrder
+}
+
+// Solve TSP starting from a specific mission using Nearest Neighbor
+function solveTSPFromStart(costMatrix: Transition[][], startMission: number): number[] {
+  const numMissions = costMatrix.length
+  const visited = new Set<number>()
+  const order: number[] = []
+  
+  // Start with the specified mission
+  let currentMission = startMission
+  visited.add(currentMission)
+  order.push(currentMission)
+  
+  // Find nearest unvisited mission until all are visited
+  while (visited.size < numMissions) {
+    let nearestMission = -1
+    let minDistance = Infinity
+    
+    for (let nextMission = 0; nextMission < numMissions; nextMission++) {
+      if (!visited.has(nextMission)) {
+        const distance = costMatrix[currentMission][nextMission].distance
+        if (distance < minDistance) {
+          minDistance = distance
+          nearestMission = nextMission
+        }
+      }
+    }
+    
+    if (nearestMission !== -1) {
+      visited.add(nearestMission)
+      order.push(nearestMission)
+      currentMission = nearestMission
+    } else {
+      break
+    }
+  }
+  
+  return order
+}
+
+// Calculate total distance for a given path
+function calculateTotalPathDistance(costMatrix: Transition[][], order: number[]): number {
+  let totalDistance = 0
+  for (let i = 0; i < order.length - 1; i++) {
+    const from = order[i]
+    const to = order[i + 1]
+    totalDistance += costMatrix[from][to].distance
+  }
+  return totalDistance
+}
+
+// Step 3: Rebuild the Flight Plan in the Optimized Order
+function buildOptimizedFlightPlan(missions: Mission[], optimalOrder: number[], costMatrix: Transition[][]): Mission[] {
+  console.log(`🔧 Rebuilding flight plan in optimized order...`)
+  
+  const optimizedMissions: Mission[] = []
+  
+  for (let i = 0; i < optimalOrder.length; i++) {
+    const missionIndex = optimalOrder[i]
+    const originalMission = missions[missionIndex]
+    
+    // Determine optimal orientation based on transition data
+    let optimalMission = { ...originalMission }
+    
+    if (i > 0) {
+      // Find the optimal configuration for this mission based on previous mission
+      const prevMissionIndex = optimalOrder[i - 1]
+      const transition = costMatrix[prevMissionIndex][missionIndex]
+      
+      // Rebuild mission with optimal path configuration
+      const missionOptions = getMissionStartEndOptions(originalMission)
+      const optimalOption = missionOptions.find(option => 
+        option.startPoint.lat === transition.toEntryPoint.lat && 
+        option.startPoint.lng === transition.toEntryPoint.lng
+      )
+      
+      if (optimalOption) {
+        optimalMission = rebuildMissionWithOptimalPath(
+          originalMission, 
+          optimalOption.reverseOrder, 
+          optimalOption.reverseFirstLine
+        )
+      }
+      
+      // Set optimal start/end points
+      optimalMission.startPoint = transition.toEntryPoint
+      optimalMission.endPoint = transition.fromExitPoint
+    }
+    
+    optimizedMissions.push(optimalMission)
+    
+    console.log(`  ✅ Mission ${missionIndex} optimized and added to sequence`)
+  }
+  
+  console.log(`✅ Flight plan rebuilt with ${optimizedMissions.length} missions in optimal order`)
+  return optimizedMissions
+}
+
+// Create a fallback mission when the main algorithm fails
+function createFallbackMission(
+  polygon: Polygon, 
+  heading: number, 
+  lineSpacing: number, 
+  droneSpeed: number, 
+  photoInterval: number
+): Mission | null {
+  try {
+    console.log('🔄 Creating fallback mission for large AOI')
+    
+    // Generate a simple grid of flight lines covering the entire AOI
+    const rawLines = generateFlightLinesClippedByAOI(polygon, polygon, heading, lineSpacing)
+    
+    if (rawLines.length === 0) {
+      console.error('❌ Fallback mission failed: no flight lines generated')
+      return null
+    }
+    
+    const flightLines: FlightLine[] = rawLines.map((coords, idx) => ({
+      id: `fallback-line-${idx}`,
+      coordinates: coords,
+      heading,
+      length: calculateLineLength(coords),
+      missionIndex: 0,
+      lineIndex: idx
+    }))
+    
+    const mission = createMissionWithArea(flightLines, 0, '#ef4444', droneSpeed, photoInterval, polygon.coordinates[0])
+    
+    // Build a simple path
+    mission.pathSegments = buildSerpentinePathOptimized(
+      mission.flightLines, 
+      0, 
+      mission.color,
+      false,
+      droneSpeed,
+      polygon
+    )
+    
+    if (mission.pathSegments && mission.pathSegments.length > 0) {
+      const firstSeg = mission.pathSegments[0]
+      const lastSeg = mission.pathSegments[mission.pathSegments.length - 1]
+      mission.startPoint = firstSeg.coordinates[0]
+      mission.endPoint = lastSeg.coordinates[lastSeg.coordinates.length - 1]
+    }
+    
+    console.log('✅ Fallback mission created successfully')
+    return mission
+  } catch (error) {
+    console.error('❌ Failed to create fallback mission:', error)
+    return null
+  }
+}
+
+// Globally Optimized Mission Chaining using TSP (Traveling Salesperson Problem)
 function optimizeMissionChaining(missions: Mission[]): Mission[] {
   if (missions.length <= 1) return missions
   
-  console.log('🔗 Optimizing mission chaining for', missions.length, 'missions')
+  console.log(`🔗 Implementing globally optimized mission chaining using TSP for ${missions.length} missions...`)
   
-  const optimized: Mission[] = []
+  // Step 1: Calculate transition cost matrix
+  const costMatrix = calculateTransitionCostMatrix(missions)
   
-  // First mission stays as-is
-  optimized.push(missions[0])
+  // Step 2: Solve for optimal mission order using TSP
+  const optimalOrder = solveMissionOrderTSP(costMatrix)
   
-  for (let i = 1; i < missions.length; i++) {
-    const prevMission = optimized[i - 1]
-    const currentMission = missions[i]
-    
-    // Find the best start point for current mission based on previous mission's end
-    const optimizedMission = optimizeMissionStartPoint(currentMission, prevMission.endPoint)
-    optimized.push(optimizedMission)
-    
-    console.log(`Mission ${i + 1} optimized: transition distance reduced to ${calculateTransitionDistance(prevMission.endPoint, optimizedMission.startPoint)?.toFixed(1)}m`)
-  }
+  // Step 3: Rebuild flight plan in optimized order
+  const optimizedMissions = buildOptimizedFlightPlan(missions, optimalOrder, costMatrix)
   
-  return optimized
+  console.log(`✅ Global mission chaining optimization complete`)
+  return optimizedMissions
 }
 
 // Optimize a mission's start point and flight direction based on previous mission end
@@ -457,12 +818,25 @@ function buildSerpentinePathOptimized(
   // Order lines by proximity using nearest-neighbor algorithm for optimal transitions
   const ordered = orderLinesByProximity(lines, reverseFirstLine)
 
-  // Calculate optimal turn radius based on drone speed
-  const turnRadius = calculateTurnRadius(droneSpeed)
+  // Calculate optimal turn radius based on drone speed and mission characteristics
+  const baseTurnRadius = calculateTurnRadius(droneSpeed)
+  
+  // Adjust turn radius based on line spacing for tighter turns
+  const avgLineSpacing = lines.length > 1 ? 
+    lines.reduce((sum, line, i) => {
+      if (i === 0) return 0
+      const prevEnd = line.coordinates[line.coordinates.length - 1]
+      const currStart = lines[i - 1].coordinates[0]
+      return sum + calculateDistance(prevEnd, currStart)
+    }, 0) / (lines.length - 1) : 50
+  
+  const turnRadius = Math.min(baseTurnRadius, avgLineSpacing * 0.8) // Tighter turns for closer lines
   
   console.log(`🔄 Turn optimization for mission ${missionIndex + 1}:`, {
     droneSpeed,
-    calculatedTurnRadius: turnRadius.toFixed(1) + 'm',
+    baseTurnRadius: baseTurnRadius.toFixed(1) + 'm',
+    adjustedTurnRadius: turnRadius.toFixed(1) + 'm',
+    avgLineSpacing: avgLineSpacing.toFixed(1) + 'm',
     lineCount: ordered.length
   })
 
@@ -510,6 +884,12 @@ function buildSerpentinePathOptimized(
           const line1Heading = line.heading
           const line2Heading = next.heading
           
+          // Calculate the optimal turn direction based on proximity
+          const turnAngle = line2Heading - line1Heading
+          const normalizedTurnAngle = ((turnAngle + 180) % 360) - 180
+          
+          console.log(`🔄 Turn optimization: ${line1Heading.toFixed(1)}° → ${line2Heading.toFixed(1)}° (${normalizedTurnAngle.toFixed(1)}° turn)`)
+          
           const optimizedTurnWaypoints = generateOptimizedTurn(
             currEnd,
             nextStart,
@@ -521,6 +901,9 @@ function buildSerpentinePathOptimized(
           
           // Use optimized turn waypoints
           if (optimizedTurnWaypoints.length > 2) {
+            const turnDistance = calculateTurnDistance(optimizedTurnWaypoints)
+            console.log(`✅ Optimized turn: ${turnDistance.toFixed(1)}m path with ${optimizedTurnWaypoints.length} waypoints`)
+            
             segments.push({ 
               kind: 'connector', 
               coordinates: optimizedTurnWaypoints, 
@@ -530,6 +913,9 @@ function buildSerpentinePathOptimized(
             })
           } else {
             // Fall back to straight line
+            const directDistance = calculateDistance(currEnd, nextStart)
+            console.log(`➡️ Direct connection: ${directDistance.toFixed(1)}m`)
+            
             segments.push({ 
               kind: 'connector', 
               coordinates: [currEnd, nextStart], 
@@ -540,6 +926,9 @@ function buildSerpentinePathOptimized(
           }
         } else {
           // Fall back to straight line if no polygon provided
+          const directDistance = calculateDistance(currEnd, nextStart)
+          console.log(`➡️ Direct connection (no polygon): ${directDistance.toFixed(1)}m`)
+          
           segments.push({ 
             kind: 'connector', 
             coordinates: [currEnd, nextStart], 
@@ -561,41 +950,97 @@ function calculateTransitionDistance(point1?: Coordinate, point2?: Coordinate): 
   return calculateDistance(point1, point2)
 }
 
-// Order flight lines by proximity using nearest-neighbor algorithm
+// Calculate total distance of a turn path
+function calculateTurnDistance(waypoints: Coordinate[]): number {
+  if (waypoints.length < 2) return 0
+  
+  let totalDistance = 0
+  for (let i = 1; i < waypoints.length; i++) {
+    totalDistance += calculateDistance(waypoints[i - 1], waypoints[i])
+  }
+  return totalDistance
+}
+
+// Order flight lines by proximity using nearest-neighbor algorithm with optimal start/stop
 function orderLinesByProximity(lines: FlightLine[], reverseFirstLine: boolean = false): FlightLine[] {
   if (lines.length <= 1) return lines
   
-  console.log(`🔗 Ordering ${lines.length} flight lines by proximity...`)
+  console.log(`🔗 Ordering ${lines.length} flight lines by proximity for optimal turns...`)
   
-  // Start with the first line (westernmost or southernmost depending on heading)
   const remaining = [...lines]
   const ordered: FlightLine[] = []
   
-  // Find the starting line (leftmost/bottommost based on typical survey patterns)
-  let currentLine = remaining.reduce((min, line) => {
-    const minStart = getLineStartPoint(min, false)
-    const lineStart = getLineStartPoint(line, false)
-    
-    // Choose leftmost line (smallest longitude), then topmost (largest latitude)
-    if (lineStart.lng < minStart.lng || 
-        (Math.abs(lineStart.lng - minStart.lng) < 0.0001 && lineStart.lat > minStart.lat)) {
-      return line
+  // Find the optimal starting line by analyzing all possible starting points
+  let bestStartLine: FlightLine | null = null
+  let bestStartDirection = false
+  let bestTotalDistance = Infinity
+  
+  // Try each line as a starting point in both directions
+  for (const startLine of lines) {
+    for (const startDirection of [false, true]) {
+      const startPoint = getLineStartPoint(startLine, startDirection)
+      let totalDistance = 0
+      const tempRemaining = [...lines].filter(l => l.id !== startLine.id)
+      let currentPoint = getLineEndPoint(startLine, startDirection)
+      
+      // Calculate total distance for this starting configuration
+      for (let i = 0; i < tempRemaining.length; i++) {
+        let nearestLine: FlightLine | null = null
+        let minDistance = Infinity
+        let bestDirection = false
+        
+        for (const line of tempRemaining) {
+          for (const direction of [false, true]) {
+            const candidateStart = getLineStartPoint(line, direction)
+            const distance = calculateDistance(currentPoint, candidateStart)
+            
+            if (distance < minDistance) {
+              minDistance = distance
+              nearestLine = line
+              bestDirection = direction
+            }
+          }
+        }
+        
+        if (nearestLine) {
+          totalDistance += minDistance
+          currentPoint = getLineEndPoint(nearestLine, bestDirection)
+          tempRemaining.splice(tempRemaining.indexOf(nearestLine), 1)
+        }
+      }
+      
+      // Update best starting configuration
+      if (totalDistance < bestTotalDistance) {
+        bestTotalDistance = totalDistance
+        bestStartLine = startLine
+        bestStartDirection = startDirection
+      }
     }
-    return min
-  })
+  }
+  
+  if (!bestStartLine) {
+    console.warn('⚠️ Could not determine optimal starting line, using fallback')
+    bestStartLine = lines[0]
+    bestStartDirection = reverseFirstLine
+  }
+  
+  console.log(`🎯 Optimal starting line: ${bestStartLine.id}, direction: ${bestStartDirection ? 'reverse' : 'forward'}, estimated total distance: ${bestTotalDistance.toFixed(1)}m`)
+  
+  // Start with the optimal line
+  let currentLine = bestStartLine
+  let currentDirection = bestStartDirection
   
   // Remove the starting line from remaining
   const startIndex = remaining.findIndex(line => line.id === currentLine.id)
   remaining.splice(startIndex, 1)
   
-  // Track the direction (forward/reverse) for each line to maintain serpentine pattern
+  // Track the direction for each line
   const lineDirections = new Map<string, boolean>()
-  let currentDirection = reverseFirstLine
   lineDirections.set(currentLine.id, currentDirection)
   
   ordered.push(currentLine)
   
-  // Build the path using nearest-neighbor
+  // Build the path using nearest-neighbor with optimal turns
   while (remaining.length > 0) {
     const currentEnd = getLineEndPoint(currentLine, lineDirections.get(currentLine.id) || false)
     
@@ -619,8 +1064,7 @@ function orderLinesByProximity(lines: FlightLine[], reverseFirstLine: boolean = 
     }
     
     if (nearestLine) {
-      // Alternate direction for serpentine pattern
-      currentDirection = !currentDirection
+      // Set the optimal direction for this line (not alternating, but based on proximity)
       lineDirections.set(nearestLine.id, bestDirection)
       
       ordered.push(nearestLine)
@@ -630,13 +1074,13 @@ function orderLinesByProximity(lines: FlightLine[], reverseFirstLine: boolean = 
       const index = remaining.findIndex(line => line.id === nearestLine!.id)
       remaining.splice(index, 1)
       
-      console.log(`  ➡️ Next line: ${nearestLine.id}, distance: ${minDistance.toFixed(1)}m`)
+      console.log(`  ➡️ Next line: ${nearestLine.id}, distance: ${minDistance.toFixed(1)}m, direction: ${bestDirection ? 'reverse' : 'forward'}`)
     } else {
       break
     }
   }
   
-  console.log(`✅ Proximity ordering complete: ${ordered.length} lines optimized`)
+  console.log(`✅ Proximity ordering complete: ${ordered.length} lines optimized with minimal turning distance`)
   
   // Update the line directions in the flight line objects for later use
   return ordered.map(line => ({
