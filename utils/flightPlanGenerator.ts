@@ -135,7 +135,7 @@ function calculateLineLength(coordinates: { lat: number; lng: number }[]): numbe
   return totalLength
 }
 
-// --- Polygon-based partitioning ---
+// --- Polygon-based partitioning using "Generate-Then-Partition" algorithm ---
 function partitionAOIIntoPolygonMissions(
   polygon: Polygon,
   heading: number,
@@ -146,7 +146,7 @@ function partitionAOIIntoPolygonMissions(
 ): Mission[] {
   const { north, south, east, west } = polygon.bounds
   
-  // Dimensions (meters)
+  // Dimensions (meters) for logging purposes
   const widthEW = calculateDistance({ lat: north, lng: west }, { lat: north, lng: east })
   const heightNS = calculateDistance({ lat: north, lng: west }, { lat: south, lng: west })
   const perpendicularWidth = (heading === 0 || heading === 180) ? widthEW : heightNS
@@ -154,7 +154,7 @@ function partitionAOIIntoPolygonMissions(
   
   const batteryTime = maxBatteryTime * 0.9 // reserve margin
   
-  console.log('🔍 Partitioning AOI:', {
+  console.log('🔍 Implementing "Generate-Then-Partition" algorithm for AOI:', {
     dimensions: { widthEW: widthEW.toFixed(1), heightNS: heightNS.toFixed(1) },
     perpendicularWidth: perpendicularWidth.toFixed(1),
     alongHeadingLength: alongHeadingLength.toFixed(1),
@@ -163,218 +163,142 @@ function partitionAOIIntoPolygonMissions(
     estimatedLines: Math.ceil(perpendicularWidth / lineSpacing)
   })
   
-  function estimateTimeForStrip(stripWidthM: number): { timeMin: number; numLines: number; totalLength: number } {
-    const numLines = Math.max(1, Math.ceil(stripWidthM / lineSpacing) + 1)
-    const totalLength = numLines * alongHeadingLength
-    const flightTime = totalLength / droneSpeed / 60
-    const photoCount = Math.ceil(totalLength / photoInterval)
-    const photoTime = (photoCount * 2) / 60
-    const turnTime = numLines * 0.5 // 30s per line
-    return { timeMin: flightTime + photoTime + turnTime, numLines, totalLength }
+  // ============================================================================
+  // STEP 1: Generate All Flight Lines for the Entire Polygon
+  // ============================================================================
+  
+  console.log('📐 Step 1: Generating all flight lines for the entire polygon...')
+  
+  // Generate complete, ordered set of flight lines that cover the whole survey area
+  const allRawLines = generateFlightLinesClippedByAOI(polygon, polygon, heading, lineSpacing)
+  
+  if (allRawLines.length === 0) {
+    console.warn('⚠️ No flight lines could be generated for the entire polygon.')
+    return [] // Return early if the area is unflyable
   }
   
-  function findStripWidthForBattery(maxWidthM: number): number {
-    // Calculate the maximum number of lines that can fit in battery time
-    const maxLinesPerBattery = Math.floor(batteryTime / 0.5) // Assume 0.5 min per line minimum
-    const maxStripWidth = Math.max(lineSpacing, (maxLinesPerBattery - 1) * lineSpacing)
-    
-    // For very large areas (>2km wide), force aggressive partitioning
-    if (maxWidthM > 2000) {
-      console.log(`🌍 Very large area detected (${maxWidthM.toFixed(1)}m), forcing aggressive partitioning`)
-      const targetMissions = Math.max(3, Math.ceil(maxWidthM / 800)) // Aim for reasonable mission count
-      const forcedWidth = Math.max(lineSpacing * 2, maxWidthM / targetMissions)
-      return Math.min(forcedWidth, maxStripWidth)
-    }
-    
-    // For medium areas (500m - 2km), moderate partitioning
-    if (maxWidthM > 500) {
-      console.log(`🏞️ Medium area detected (${maxWidthM.toFixed(1)}m), using moderate partitioning`)
-      // Try to fit the entire area in 1-2 missions if possible
-      const estimatedTime = estimateTimeForStrip(maxWidthM)
-      if (estimatedTime.timeMin <= batteryTime) {
-        console.log(`✅ Entire area fits in one mission (${estimatedTime.timeMin.toFixed(1)}min)`)
-        return maxWidthM
-      }
-      
-      // Split into 2 missions if possible
-      const halfWidth = maxWidthM / 2
-      const halfTime = estimateTimeForStrip(halfWidth)
-      if (halfTime.timeMin <= batteryTime) {
-        console.log(`✅ Area fits in 2 missions (${halfTime.timeMin.toFixed(1)}min each)`)
-        return halfWidth
-      }
-    }
-    
-    // For smaller areas (<500m), try to fit in single mission first
-    if (maxWidthM <= 500) {
-      console.log(`🏘️ Small area detected (${maxWidthM.toFixed(1)}m), attempting single mission`)
-      const estimatedTime = estimateTimeForStrip(maxWidthM)
-      if (estimatedTime.timeMin <= batteryTime) {
-        console.log(`✅ Small area fits in single mission (${estimatedTime.timeMin.toFixed(1)}min)`)
-        return maxWidthM
-      }
-    }
-    
-    // Fallback: use binary search to find optimal width
-    let lo = Math.max(lineSpacing, Math.min(lineSpacing * 2, maxWidthM * 0.1))
-    let hi = Math.max(lo, Math.min(maxWidthM, maxStripWidth))
-    let best = lo
-    
-    // Binary search for optimal width
-    for (let i = 0; i < 20; i++) {
-      const mid = (lo + hi) / 2
-      const { timeMin } = estimateTimeForStrip(mid)
-      if (timeMin <= batteryTime) {
-        best = mid
-        lo = mid
-      } else {
-        hi = mid
-      }
-    }
-    
-    return Math.min(best, maxStripWidth)
-  }
+  console.log(`✅ Generated ${allRawLines.length} flight lines covering the entire polygon`)
+  
+  // Convert raw lines to FlightLine objects
+  const allFlightLines: FlightLine[] = allRawLines.map((coords, idx) => ({
+    id: `line-${idx}`,
+    coordinates: coords,
+    heading,
+    length: calculateLineLength(coords),
+    missionIndex: 0, // Placeholder index, will be updated during mission creation
+    lineIndex: idx
+  }))
+  
+  // ============================================================================
+  // STEP 2: Group Consecutive Lines into Missions by Time Budget
+  // ============================================================================
+  
+  console.log('⏱️ Step 2: Grouping flight lines into missions based on battery time budget...')
   
   const missions: Mission[] = []
-  let remainingWidth = perpendicularWidth
-  let offsetFromWestOrSouth = 0 // meters from west (if heading NS) or from south (if heading EW)
-  let missionIdx = 0
   const colors = ['#ef4444','#10b981','#3b82f6','#f59e0b','#8b5cf6','#06b6d4','#84cc16','#f97316']
   
-  while (remainingWidth > 0.1) {
-    const widthForBattery = findStripWidthForBattery(remainingWidth)
+  let currentMissionLines: FlightLine[] = []
+  let currentMissionTime = 0
+  let missionIndex = 0
+  
+  for (const line of allFlightLines) {
+    // Calculate the time cost of this specific flight line
+    const flightTime = line.length / droneSpeed / 60 // Convert to minutes
+    const photoCount = Math.ceil(line.length / photoInterval)
+    const photoTime = (photoCount * 2) / 60 // 2 seconds per photo, convert to minutes
+    const turnTime = 0.5 // 30-second turn penalty between lines
+    const totalLineTime = flightTime + photoTime + turnTime
     
-    console.log(`📏 Mission ${missionIdx + 1}: remaining=${remainingWidth.toFixed(1)}m, strip=${widthForBattery.toFixed(1)}m`)
+    console.log(`📊 Line ${line.lineIndex}: length=${line.length.toFixed(1)}m, time=${totalLineTime.toFixed(2)}min (flight:${flightTime.toFixed(2)}, photos:${photoTime.toFixed(2)}, turn:${turnTime.toFixed(2)})`)
     
-    // Safety check: ensure we're making progress and not getting stuck
-    if (widthForBattery < lineSpacing * 0.5 || widthForBattery > remainingWidth * 0.9) {
-      console.warn(`⚠️ Strip width issue: width=${widthForBattery.toFixed(2)}m, remaining=${remainingWidth.toFixed(2)}m, forcing reasonable width`)
-      const forcedWidth = Math.max(lineSpacing, Math.min(remainingWidth * 0.3, lineSpacing * 10))
-      remainingWidth = Math.max(0, remainingWidth - forcedWidth)
-      offsetFromWestOrSouth += forcedWidth
-      missionIdx++
-      continue
-    }
-    
-    const proportionStart = offsetFromWestOrSouth / perpendicularWidth
-    const proportionEnd = Math.min(1, (offsetFromWestOrSouth + widthForBattery) / perpendicularWidth)
-    
-    // Build rectangular strip polygon aligned to bounds
-    let strip: Polygon
-    if (heading === 0 || heading === 180) {
-      // Slice west→east using longitude interpolation
-      const lngStart = west + (east - west) * proportionStart
-      const lngEnd = west + (east - west) * proportionEnd
-      const ring: Coordinate[] = [
-        { lat: north, lng: lngStart },
-        { lat: north, lng: lngEnd },
-        { lat: south, lng: lngEnd },
-        { lat: south, lng: lngStart },
-        { lat: north, lng: lngStart }
-      ]
-      strip = {
-        coordinates: [ring],
-        area: alongHeadingLength * (widthForBattery),
-        bounds: { north, south, east: lngEnd, west: lngStart }
-      }
-    } else {
-      // Slice south→north using latitude interpolation
-      const latStart = south + (north - south) * proportionStart
-      const latEnd = south + (north - south) * proportionEnd
-      const ring: Coordinate[] = [
-        { lat: latEnd, lng: east },
-        { lat: latEnd, lng: west },
-        { lat: latStart, lng: west },
-        { lat: latStart, lng: east },
-        { lat: latEnd, lng: east }
-      ]
-      strip = {
-        coordinates: [ring],
-        area: alongHeadingLength * (widthForBattery),
-        bounds: { north: latEnd, south: latStart, east, west }
-      }
-    }
-
-    // Generate lines within this strip
-    const rawLines = generateFlightLinesClippedByAOI(strip, polygon, heading, lineSpacing)
-    
-    // Safety check: ensure we have valid flight lines
-    if (rawLines.length === 0) {
-      console.warn(`⚠️ No flight lines generated for strip ${missionIdx}, skipping`)
-      remainingWidth -= widthForBattery
-      offsetFromWestOrSouth += widthForBattery
-      missionIdx++
-      continue
-    }
-    
-    const flightLines: FlightLine[] = rawLines.map((coords, idx) => ({
-      id: `m${missionIdx}-line-${idx}`,
-      coordinates: coords,
-      heading,
-      length: calculateLineLength(coords),
-      missionIndex: missionIdx,
-      lineIndex: idx
-    }))
-
-    const mission = createMissionWithArea(flightLines, missionIdx, colors[missionIdx % colors.length], droneSpeed, photoInterval, strip.coordinates[0])
-    
-    // Safety check: ensure mission doesn't exceed battery time
-    if (mission.estimatedTime > batteryTime) {
-      console.warn(`⚠️ Mission ${missionIdx + 1} exceeds battery time: ${mission.estimatedTime.toFixed(1)}min > ${batteryTime.toFixed(1)}min`)
-      console.warn(`⚠️ Forcing mission to fit within battery constraints`)
+    // If adding this line exceeds the battery budget, finalize the previous mission
+    if (currentMissionTime + totalLineTime > batteryTime && currentMissionLines.length > 0) {
+      console.log(`🔋 Mission ${missionIndex} complete: ${currentMissionLines.length} lines, ${currentMissionTime.toFixed(2)}min`)
       
-      // Recalculate with a smaller strip width
-      const maxLinesForBattery = Math.floor(batteryTime / 0.5)
-      const maxWidthForBattery = Math.max(lineSpacing, (maxLinesForBattery - 1) * lineSpacing)
+      const newMission = createMissionWithArea(
+        currentMissionLines.map((l, idx) => ({ ...l, missionIndex, lineIndex: idx })),
+        missionIndex,
+        colors[missionIndex % colors.length],
+        droneSpeed,
+        photoInterval,
+        polygon.coordinates[0] // Use main polygon for area reference
+      )
       
-      if (maxWidthForBattery < widthForBattery) {
-        console.log(`🔄 Adjusting strip width from ${widthForBattery.toFixed(1)}m to ${maxWidthForBattery.toFixed(1)}m`)
-        // Rollback and try again with smaller width
-        remainingWidth += widthForBattery - maxWidthForBattery
-        offsetFromWestOrSouth -= widthForBattery - maxWidthForBattery
-        continue
+      // Build optimized serpentine path for this mission
+      newMission.pathSegments = buildSerpentinePathOptimized(
+        newMission.flightLines, 
+        missionIndex, 
+        newMission.color,
+        false, // reverseFirstLine
+        droneSpeed,
+        polygon
+      )
+      
+      // Derive start/end from full mission path
+      if (newMission.pathSegments && newMission.pathSegments.length > 0) {
+        const firstSeg = newMission.pathSegments[0]
+        const lastSeg = newMission.pathSegments[newMission.pathSegments.length - 1]
+        newMission.startPoint = firstSeg.coordinates[0]
+        newMission.endPoint = lastSeg.coordinates[lastSeg.coordinates.length - 1]
       }
+      
+      missions.push(newMission)
+      
+      // Start a new mission
+      missionIndex++
+      currentMissionLines = []
+      currentMissionTime = 0
+      
+      console.log(`🆕 Starting new mission ${missionIndex}`)
     }
     
-    // Build optimized serpentine path with improved turns
-    mission.pathSegments = buildSerpentinePathOptimized(
-      mission.flightLines, 
-      missionIdx, 
-      mission.color,
+    // Add the current line to the current mission
+    currentMissionLines.push({ ...line, missionIndex })
+    currentMissionTime += totalLineTime
+    
+    console.log(`➕ Added line to mission ${missionIndex}: total time now ${currentMissionTime.toFixed(2)}min`)
+  }
+  
+  // Add the last remaining mission
+  if (currentMissionLines.length > 0) {
+    console.log(`🔋 Final mission ${missionIndex}: ${currentMissionLines.length} lines, ${currentMissionTime.toFixed(2)}min`)
+    
+    const finalMission = createMissionWithArea(
+      currentMissionLines.map((l, idx) => ({ ...l, missionIndex, lineIndex: idx })),
+      missionIndex,
+      colors[missionIndex % colors.length],
+      droneSpeed,
+      photoInterval,
+      polygon.coordinates[0]
+    )
+    
+    // Build optimized serpentine path for final mission
+    finalMission.pathSegments = buildSerpentinePathOptimized(
+      finalMission.flightLines, 
+      missionIndex, 
+      finalMission.color,
       false, // reverseFirstLine
       droneSpeed,
       polygon
     )
     
     // Derive start/end from full mission path
-    if (mission.pathSegments && mission.pathSegments.length > 0) {
-      const firstSeg = mission.pathSegments[0]
-      const lastSeg = mission.pathSegments[mission.pathSegments.length - 1]
-      mission.startPoint = firstSeg.coordinates[0]
-      mission.endPoint = lastSeg.coordinates[lastSeg.coordinates.length - 1]
+    if (finalMission.pathSegments && finalMission.pathSegments.length > 0) {
+      const firstSeg = finalMission.pathSegments[0]
+      const lastSeg = finalMission.pathSegments[finalMission.pathSegments.length - 1]
+      finalMission.startPoint = firstSeg.coordinates[0]
+      finalMission.endPoint = lastSeg.coordinates[lastSeg.coordinates.length - 1]
     }
     
-    missions.push(mission)
-
-    // Advance
-    remainingWidth -= widthForBattery
-    offsetFromWestOrSouth += widthForBattery
-    missionIdx++
-
-    // Safety to avoid infinite loops and ensure progress
-    if (missionIdx > 100) {
-      console.warn('⚠️ Safety limit reached, forcing completion')
-      break
-    }
-    
-    // Ensure we're making progress
-    if (widthForBattery < remainingWidth * 0.01) {
-      console.warn('⚠️ Strip width too small relative to remaining width, forcing completion')
-      break
-    }
+    missions.push(finalMission)
   }
-
-  console.log(`✅ Generated ${missions.length} missions for AOI`)
+  
+  console.log(`✅ Generated ${missions.length} shape-aware missions using "Generate-Then-Partition" algorithm`)
+  
+  // ============================================================================
+  // STEP 3: Post-Processing and Optimization
+  // ============================================================================
   
   // If no missions were generated, create a fallback mission
   if (missions.length === 0) {
@@ -387,10 +311,10 @@ function partitionAOIIntoPolygonMissions(
   
   // Merge adjacent missions whose combined time fits a single battery
   const packed = packMissionsByBattery(missions, maxBatteryTime, droneSpeed, photoInterval)
-
+  
   // Optimize mission chaining for efficient transitions
   const chained = optimizeMissionChaining(packed)
-
+  
   return chained
 }
 
