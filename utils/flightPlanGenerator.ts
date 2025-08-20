@@ -665,7 +665,7 @@ function optimizeMissionChaining(missions: Mission[]): Mission[] {
   console.log(`✅ Global mission chaining optimization complete`)
   return optimizedMissions
 }
-
+//commit
 // Optimize a mission's start point and flight direction based on previous mission end
 function optimizeMissionStartPoint(mission: Mission, prevEndPoint?: Coordinate): Mission {
   if (!prevEndPoint || !mission.flightLines.length) return mission
